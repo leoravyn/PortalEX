@@ -212,6 +212,58 @@ typedef struct {
     int used;
 } vw_step_t;
 static vw_step_t g_steps_q[STEP_QUEUE_CAP];
+/*
+ * ---- 步事件"同时下发"的诊断计数器（2026-09-21 加，为查"每约 20 秒一次步数尖峰"）----
+ *
+ * 现象：客户端（1 秒轮询）偶发看到**两条步事件几乎同时**到达 ⇒ 按事件时间戳算步频时会得到
+ * 一个荒谬的瞬时值。要定责得分开看两个环节：
+ *   · g_step_multi_push —— `vw_update_state` 一次推送里带了 ≥2 步。此时 `per = span/delta`
+ *     把这两步**摊在前一次推送的间隔里**，间隔被压缩成 span/2（例如 25ms）；
+ *   · g_step_short_gap  —— 实际发出时与上一条步事件间隔 < 100ms（压缩真的发生了）。
+ * 两者都在 status 里可读，诊断页/日志一眼能看出"是不是我们排的时刻挤在一起"。
+ */
+static long long g_step_multi_push = 0;   /* delta ≥ 2 的推送次数 */
+static long long g_step_short_gap = 0;    /* 与上一条步事件间隔 < 100ms 的次数 */
+static long long g_step_rebase_skipped = 0; /* 被判为"基线搬移"而**没有**发出去的步数 */
+static long long g_last_step_emit_ts = 0; /* 上一条**实际发出**的步事件时间戳（诊断用） */
+static long long g_last_step_due = 0;     /* 上一条步事件的**排定**时刻（对比压缩/钳位） */
+
+/*
+ * ---- 步事件**专用**时间戳（2026-09-21 修"两条步事件几乎同时"）----
+ *
+ * 为什么不能借用通用的 [jitter_ts]：它有一条**全局**单调钳位 `ts = g_last_emit_ts + 1`，
+ * 而步事件天生是"迟到"的 —— 它们的排定时刻落在**上一次推送的间隔里**（空闲拍长时可达 1 秒），
+ * 这段时间里 IMU 通道早就以 20~66ms 的节奏把 g_last_emit_ts 推到了"现在"附近。
+ * 于是每条步事件都被钳成"上一条事件 + 1ns"：实测三条步事件的时间戳只差 **1ns**
+ * （排定差明明是 284ms）⇒ 客户端按事件时间戳算步频会得到无穷大，这正是"步数尖峰"。
+ *
+ * 新口径：步事件按**自己**的游标走 —— 排定时刻 + 抖动，且与上一条步事件至少间隔
+ * [STEP_MIN_GAP_NS]；只保证"不越过 now"与"步流内部不回退"，**不再与 IMU 的游标对齐**。
+ * 与真机一致：HAL 各传感器的 FIFO 是各自独立的，跨传感器的时间戳本来就不保证有序；
+ * 客户端按同一传感器的 dt 计算，步流内部有序即可。
+ */
+#define STEP_MIN_GAP_NS 150000000LL /* 步与步之间至少 150ms（≈400 步/分，人类达不到；真实步间隔 ~300ms） */
+static long long g_last_step_ts = 0;
+
+static long long step_ts(long long base, long long now_ns) {
+    long long j = (long long) ((vw_rng_unit() * 2.0 - 1.0) * 15000000.0); /* ±15ms */
+    long long ts = base + j;
+    long long min_ts = g_last_step_ts + STEP_MIN_GAP_NS;
+    if (ts < min_ts) ts = min_ts;      /* 与上一条步事件至少 50ms */
+    if (ts > now_ns) ts = now_ns;      /* 不许跑到未来（客户端会丢） */
+    if (ts < g_last_step_ts) ts = g_last_step_ts; /* 挤不下时也不回退 */
+    g_last_step_ts = ts;
+    return ts;
+}
+/* jitter 的两类"被迫改动"计数（定义在下面 jitter_ts 附近使用；这里先声明以便状态串读取） */
+static long long g_jitter_clamp_now = 0;
+static long long g_jitter_force_next = 0;
+
+long long vw_step_multi_push_count(void) { return g_step_multi_push; }
+long long vw_step_short_gap_count(void) { return g_step_short_gap; }
+long long vw_step_rebase_skipped(void) { return g_step_rebase_skipped; }
+long long vw_jitter_clamp_count(void) { return g_jitter_clamp_now; }
+long long vw_jitter_force_count(void) { return g_jitter_force_next; }
 static long long g_last_steps_seen = 0;
 static long long g_last_step_push_nanos = 0;
 
@@ -250,7 +302,7 @@ static long long jitter_ts(long long base, long long span_ns, long long now_ns) 
     if (amp > 2000000) amp = 2000000;  /* 至多 2ms */
     long long j = (long long) ((rng_unit() * 2.0 - 1.0) * (double) amp);
     long long ts = base + j;
-    if (ts > now_ns) ts = now_ns;
+    if (ts > now_ns) { ts = now_ns; g_jitter_clamp_now++; }
     /*
      * 单调性修正**不能越过 now**：真机上"时间戳在未来"会被严格客户端直接丢弃
      * （同一个调用里事件数比时钟分辨率还密时，旧实现的 `g_last_emit_ts + 1` 会把
@@ -259,6 +311,7 @@ static long long jitter_ts(long long base, long long span_ns, long long now_ns) 
      * 而"未来时间戳"不是。
      */
     if (ts <= g_last_emit_ts) {
+        g_jitter_force_next++;
         ts = g_last_emit_ts + 1;
         if (ts > now_ns) ts = now_ns;
     }
@@ -532,11 +585,41 @@ void vw_update_state(double speed, double azimuth_deg, int moving, long long ste
         long long per = span / delta;
         if (per <= 0) per = 1;
         long long base = steps - delta;
+        /*
+         * **计数器重基**（2026-09-21）：短时间内涨的步数超过人类可达步频时，那不是"走了这么多步"，
+         * 而是**基线被搬移**（会话重启接在真实计数器后面、宿主重放状态等）。
+         * 旧行为会把这种跳变也按 `per = span/delta` 排成一串步事件 —— span 很短时 per 退化成 1ns，
+         * 客户端于是看到"几十条步事件同时到达"，那正是步数尖峰；而它其实没有任何物理含义。
+         * 人类上限约 4 步/秒，这里给 3 倍余量（12 步/秒）当阈值：超过就只搬基线、不发事件。
+         */
+        double implied = (double) delta / ((double) span / 1e9);
+        if (delta >= 4 && implied > 12.0) {
+            g_step_rebase_skipped += delta;
+            LOGI("step rebase: delta=%lld span=%lldms（%.0f 步/秒，超过人类上限）⇒ 只搬基线，不发事件",
+                 delta, span / 1000000, implied);
+            g_last_steps_seen = steps;
+            g_last_step_push_nanos = now_nanos;
+            g_state_nanos = now_nanos;
+            pthread_mutex_unlock(&g_lock);
+            return;
+        }
+        if (delta >= 2) {
+            g_step_multi_push++;
+            LOGI("step push delta=%lld span=%lldms per=%lldms —— 一次推送多步，间隔被压到 span/delta",
+                 delta, span / 1000000, per / 1000000);
+        }
+        /*
+         * 步频侧波动：作用在**步间隔**上（间隔抖 = 步频抖，等价且实现最直接）。
+         * 每个间隔单独取一次偏差 ⇒ 慢漂让它一段快一段慢、逐条随机让它一步一个样；
+         * 参数为 0 时 vw_wobble_step_interval 原样返回（逐位一致，且不消耗随机数）。
+         */
+        long long t = g_last_step_push_nanos;
         for (long long k = 1; k <= delta; k++) {
+            t += vw_wobble_step_interval(per, now_nanos);
             for (int i = 0; i < STEP_QUEUE_CAP; i++) {
                 if (!g_steps_q[i].used) {
                     g_steps_q[i].used = 1;
-                    g_steps_q[i].ts = g_last_step_push_nanos + per * k;
+                    g_steps_q[i].ts = t;
                     g_steps_q[i].count = base + k;
                     break;
                 }
@@ -640,22 +723,50 @@ static int type_uses_accuracy(int32_t t) {
 static void fill_values(portal_sensor_event_t *e, long long now) {
     double az = virtual_azimuth(now);
     double theta = az * M_PI / 180.0;
+    /*
+     * 按组波动（角度与指南针侧）：**同一事件只取一次偏差**，角度类与向量类共用它 ——
+     * vw_wobble_dev 会推进慢漂状态并消耗随机数，取两次会让两组量的抖动互不相同、
+     * 也让"一次事件一个偏差"的语义散掉。参数全 0 时它不碰随机数（0 值逐位兼容）。
+     */
+    /*
+     * 参考量：磁场**用本机实际场强**（g_mag_h ∈ 28~42µT），不用表里的固定 50µT ——
+     * 否则 15% 的慢漂会给出 ±7.5µT（相对实际场强是 ±21%），磁场幅度抖得比真机明显。
+     * 其余类型仍取 vw_wobble_ref 的固定参考量。
+     */
+    int is_mag = (e->type == PS_TYPE_MAGNETIC_FIELD ||
+                  e->type == PS_TYPE_MAGNETIC_FIELD_UNCALIBRATED);
+    double wref = is_mag ? g_mag_h : vw_wobble_ref(e->type);
+    /*
+     * 向量类偏差：**绝对单位**（慢漂全额 ×ref + 逐条随机 ≤ref/180），且 100ms 采样保持。
+     * 只在"吃波动"的类型上取 —— 不吃的不该推进慢漂状态、也不该消耗随机数。
+     * ⚠️ 这一行曾被两次"没命中的替换"漏掉（旧口径 vw_wobble_dev 一直生效），
+     * 真机数据两轮不变才暴露出来 —— 改这里务必 grep 核验。
+     */
+    double wdev = (wref > 0.0 && vw_wobble_dims(e->type) > 0)
+            ? vw_wobble_vec_dev(VW_WOB_GROUP_ORIENTATION, wref, now) : 0.0;
+    /*
+     * 角度类（朝向 / 磁场方向 / 旋转矢量）用**同一个**角度偏差：它只依赖 (组, now)，
+     * 所以三者天然一致 —— 罗盘指的方向与报出的朝向不会再互相打脸；
+     * 且它的逐条随机最多 1°，不再让指针跳（见 vw_wobble_angle_dev 的说明）。
+     */
+    double wdeg = vw_wobble_angle_dev(VW_WOB_GROUP_ORIENTATION, now);   /* 度 */
+    double theta_w = (az + wdeg) * M_PI / 180.0;
     switch (e->type) {
         case PS_TYPE_ORIENTATION:
-            e->data.f[0] = (float) az;
+            e->data.f[0] = (float) (az + wdeg);   /* 平滑中轴 + 摆动 + 微抖 + 角度偏差 */
             add_noise_i(e, 0, vw_noise_raw(VW_NOISE_ORIENT));
             break;
         case PS_TYPE_MAGNETIC_FIELD:
-            e->data.f[0] = (float) (-g_mag_h * sin(theta));
-            e->data.f[1] = (float) (g_mag_h * cos(theta));
+            e->data.f[0] = (float) (-g_mag_h * sin(theta_w));
+            e->data.f[1] = (float) (g_mag_h * cos(theta_w));
             e->data.f[2] = (float) (-g_mag_h * g_mag_dip);
             /* 磁场逐轴定标：真机静止实测 σ ≈ 0.21 / 0.12 / 0.32 µT（同一机型 19s 探针窗口），
              * 默认 σ 即取该值（见 vw_noise.c）；Calibration 页会按本机实测覆盖。 */
             add_noise_xyz(e, VW_NOISE_MAG);
             break;
         case PS_TYPE_MAGNETIC_FIELD_UNCALIBRATED:
-            e->data.f[0] = (float) (-g_mag_h * sin(theta) + g_mag_bias_x);
-            e->data.f[1] = (float) (g_mag_h * cos(theta) + g_mag_bias_y);
+            e->data.f[0] = (float) (-g_mag_h * sin(theta_w) + g_mag_bias_x);
+            e->data.f[1] = (float) (g_mag_h * cos(theta_w) + g_mag_bias_y);
             e->data.f[2] = (float) (-g_mag_h * g_mag_dip);
             e->data.f[3] = (float) g_mag_bias_x;
             e->data.f[4] = (float) g_mag_bias_y;
@@ -699,7 +810,12 @@ static void fill_values(portal_sensor_event_t *e, long long now) {
         case PS_TYPE_ROTATION_VECTOR:
         case PS_TYPE_GAME_ROTATION_VECTOR:
         case PS_TYPE_GEOMAGNETIC_ROTATION_VECTOR: {
-            double half = theta / 2.0;
+            /*
+             * 旋转矢量吃波动的方式**和向量类不同**：加在**半角**上（参考量 π）。
+             * 直接按分量缩放会把四元数变成非单位长度 —— 客户端 `getRotationMatrixFromVector` 会
+             * 拿到一个不是旋转的"旋转矢量"，姿态整体跑偏，比不抖更糟。
+             */
+            double half = theta_w / 2.0;   /* 同一个角度偏差，四元数仍是单位四元数 */
             e->data.f[0] = 0.0f;
             e->data.f[1] = 0.0f;
             e->data.f[2] = (float) (-sin(half));
@@ -718,7 +834,31 @@ static void fill_values(portal_sensor_event_t *e, long long now) {
             break;
         default:
             break;
-    }    /*
+    }
+    /*
+     * 按组波动（角度与指南针侧）：向量类各分量叠加同一个绝对偏差 `dev × 参考量`。
+     * 用参考量而不是逐值百分比的理由见 vw_wobble.c 文件头（零基准量会永远不抖、
+     * 角度量会变成"朝向越大抖得越狠"）。旋转矢量在它自己的分支里处理，这里 dims = 0。
+     */
+    {
+        int wdims = vw_wobble_dims(e->type);
+        if (wdims > 0 && wdev != 0.0) {
+            if (is_mag) {
+                /*
+                 * 磁场**只抖幅度**：按 (1 + dev/|H|) 缩放整条矢量。
+                 * 逐分量加绝对偏差会让**方向**被噪声/漂移主导 —— 实测那样做时罗盘角 |Δ| 中位 61°
+                 * （最坏 83°），而把原始序列打出来看真实只有 ±0.2°。方向交给方位角（见 theta_w）。
+                 */
+                float k = (g_mag_h > 0.0) ? (float) (1.0 + wdev / g_mag_h) : 1.0f;
+                for (int i = 0; i < 3; i++) e->data.f[i] *= k;
+            } else {
+                /* wdev 已是**绝对单位**（慢漂全额 ×ref + 逐条 ≤ref/180）⇒ 直接加，别再乘 wref */
+                float off = (float) wdev;
+                for (int i = 0; i < wdims; i++) e->data.f[i] += off;
+            }
+        }
+    }
+    /*
      * 陀螺（实测驱动）：真机三轴都有噪声，静止实测 σ≈0.001 rad/s；x/y 只体现零偏与噪声，
      * z 是转弯角速度 + 零偏 + 噪声。
      *
@@ -882,7 +1022,17 @@ int vw_generate(portal_sensor_event_t *out, int cap, long long now_nanos, int wa
                 g_dropped += 2;
                 continue;
             }
-            long long ts = jitter_ts(step_due, 300000000LL, now_nanos);
+            long long ts = step_ts(step_due, now_nanos);
+            if (g_last_step_emit_ts != 0 && ts - g_last_step_emit_ts < 100000000LL) {
+                g_step_short_gap++;
+                LOGI("step emitted gap=%lldms 排定差=%lldms（发出 %lld vs %lld）"
+                     "—— 客户端会看到两条步事件几乎同时",
+                     (ts - g_last_step_emit_ts) / 1000000,
+                     (step_due - g_last_step_due) / 1000000,
+                     g_last_step_emit_ts, ts);
+            }
+            g_last_step_emit_ts = ts;
+            g_last_step_due = step_due;
             long long cnt = g_steps_q[step_idx].count;
             g_steps_q[step_idx].used = 0;
             /* 计数器与检测器 = **同一次步事件、同一时间戳**：一个在涨而另一个不响，
