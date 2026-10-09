@@ -32,24 +32,10 @@ jobs:
           distribution: jetbrains
           java-version: 21
 
-      - name: Cache Gradle Dependencies
-        uses: actions/cache@v4
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            !~/.gradle/caches/build-cache-*
-          key: gradle-deps-core-${{ hashFiles('**/build.gradle.kts') }}
-          restore-keys: gradle-deps
-
-      - name: Cache Gradle Build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches/build-cache-*
-            ~/.gradle/buildOutputCleanup/cache.properties
-          key: gradle-builds-core-${{ github.sha }}
-          restore-keys: gradle-builds
+          cache-provider: basic
 
       - name: Restore Debug Keystore
         id: ks
@@ -102,6 +88,58 @@ jobs:
         with:
           path: ~/.android/debug.keystore
           key: portalex-debug-keystore-v1
+
+      - name: Restore Fixed Release Keystore
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SIGNING_KEY_BASE64:-}" ]; then
+            echo "::error::Missing required secret: SIGNING_KEY_BASE64"
+            exit 1
+          fi
+          if [ -z "${SIGNING_STORE_PASSWORD:-}" ]; then
+            echo "::error::Missing required secret: SIGNING_STORE_PASSWORD"
+            exit 1
+          fi
+          if [ -z "${SIGNING_KEY_ALIAS:-}" ]; then
+            echo "::error::Missing required secret: SIGNING_KEY_ALIAS"
+            exit 1
+          fi
+          if [ -z "${SIGNING_KEY_PASSWORD:-}" ]; then
+            echo "::error::Missing required secret: SIGNING_KEY_PASSWORD"
+            exit 1
+          fi
+
+          RELEASE_KEYSTORE="$RUNNER_TEMP/release.jks"
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 --decode > "$RELEASE_KEYSTORE"
+          chmod 600 "$RELEASE_KEYSTORE"
+
+          SHA1="$(
+            keytool -list -v \
+              -keystore "$RELEASE_KEYSTORE" \
+              -storepass "$SIGNING_STORE_PASSWORD" \
+              -alias "$SIGNING_KEY_ALIAS" |
+              grep -m1 -i 'SHA1:' |
+              awk -F': ' '{print $2}'
+          )"
+          if [ -z "$SHA1" ]; then
+            echo "::error::Failed to extract SHA1 from release.jks"
+            exit 1
+          fi
+          echo "固定 release.jks SHA1: $SHA1"
+          echo "### 固定 release.jks SHA1: $SHA1" >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "KEYSTORE_PATH=$RELEASE_KEYSTORE"
+            echo "KEYSTORE_PASSWORD=$SIGNING_STORE_PASSWORD"
+            echo "KEY_ALIAS=$SIGNING_KEY_ALIAS"
+            echo "KEY_PASSWORD=$SIGNING_KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
 
       - name: Build with Gradle
         run: |
