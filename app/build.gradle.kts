@@ -173,13 +173,25 @@ fun configureAppSigningConfigsForRelease(project: Project) {
     if (keystorePath.isNullOrBlank()) {
         return
     }
+    val keystorePassword = System.getenv("KEYSTORE_PASSWORD")
+    if (keystorePassword.isNullOrBlank()) {
+        throw GradleException("KEYSTORE_PASSWORD is required when KEYSTORE_PATH is set")
+    }
+    val keyAlias = System.getenv("KEY_ALIAS")
+    if (keyAlias.isNullOrBlank()) {
+        throw GradleException("KEY_ALIAS is required when KEYSTORE_PATH is set")
+    }
+    val keyPassword = System.getenv("KEY_PASSWORD")
+    if (keyPassword.isNullOrBlank()) {
+        throw GradleException("KEY_PASSWORD is required when KEYSTORE_PATH is set")
+    }
     project.configure<ApplicationExtension> {
         signingConfigs {
             create("release") {
-                storeFile = file(System.getenv("KEYSTORE_PATH"))
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
+                storeFile = file(keystorePath)
+                storePassword = keystorePassword
+                this.keyAlias = keyAlias
+                this.keyPassword = keyPassword
                 enableV2Signing = true
             }
         }
