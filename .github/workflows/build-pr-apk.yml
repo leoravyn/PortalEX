@@ -98,21 +98,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -z "${SIGNING_KEY_BASE64:-}" ]; then
-            echo "::error::Missing required secret: SIGNING_KEY_BASE64"
-            exit 1
-          fi
-          if [ -z "${SIGNING_STORE_PASSWORD:-}" ]; then
-            echo "::error::Missing required secret: SIGNING_STORE_PASSWORD"
-            exit 1
-          fi
-          if [ -z "${SIGNING_KEY_ALIAS:-}" ]; then
-            echo "::error::Missing required secret: SIGNING_KEY_ALIAS"
-            exit 1
-          fi
-          if [ -z "${SIGNING_KEY_PASSWORD:-}" ]; then
-            echo "::error::Missing required secret: SIGNING_KEY_PASSWORD"
-            exit 1
+          if [ -z "${SIGNING_KEY_BASE64:-}" ] || [ -z "${SIGNING_STORE_PASSWORD:-}" ] || [ -z "${SIGNING_KEY_ALIAS:-}" ] || [ -z "${SIGNING_KEY_PASSWORD:-}" ]; then
+            echo "::warning::Release signing secrets are not fully configured; keeping debug keystore from previous step."
+            exit 0
           fi
 
           RELEASE_KEYSTORE="$RUNNER_TEMP/release.jks"
